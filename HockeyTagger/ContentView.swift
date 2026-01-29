@@ -373,7 +373,7 @@ struct PlayerView: NSViewRepresentable {
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.player = player
-        view.controlsStyle = .none // Hide default controls since we have our own logic
+        view.controlsStyle = .inline // Show standard video controls
         return view
     }
     
