@@ -234,7 +234,7 @@ struct ContentView: View {
             ZStack(alignment: .bottomLeading) {
                 Color.black
                 if vm.videoURL != nil {
-                    VideoPlayer(player: vm.player)
+                    PlayerView(player: vm.player)
                 } else {
                     Button("Open Video File (⌘O)") { vm.loadVideo() }
                         .controlSize(.large)
@@ -362,6 +362,24 @@ struct ContentView: View {
         let newID = vm.addTag(label: label)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             focusedField = newID
+        }
+    }
+}
+
+// Custom PlayerView to avoid SwiftUI VideoPlayer crash
+struct PlayerView: NSViewRepresentable {
+    let player: AVPlayer
+    
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        view.controlsStyle = .none // Hide default controls since we have our own logic
+        return view
+    }
+    
+    func updateNSView(_ nsView: AVPlayerView, context: Context) {
+        if nsView.player != player {
+            nsView.player = player
         }
     }
 }
