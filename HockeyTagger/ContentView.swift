@@ -48,6 +48,12 @@ struct ContentView: View {
                     return .ignored
                 })
                 .focusEffectDisabled() // Remove default focus ring visual
+
+                if viewModel.currentProject != nil {
+                    Divider()
+                    VideoTimelineView(viewModel: viewModel)
+                        .frame(height: 96)
+                }
             }
             .frame(minWidth: 500, minHeight: 400)
             

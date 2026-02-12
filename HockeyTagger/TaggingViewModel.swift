@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import AVKit
+import AppKit
 
 @Observable
 class TaggingViewModel {
@@ -9,6 +10,10 @@ class TaggingViewModel {
     var isPlaying = false
     var currentTime: Double = 0.0
     var duration: Double = 1.0 // Avoid divide by zero
+    var timelineThumbnails: [NSImage] = []
+    var zoomTimelineThumbnails: [NSImage] = []
+    var isGeneratingTimelineThumbnails = false
+    var isGeneratingZoomTimelineThumbnails = false
     
     // Mode
     enum Mode {
@@ -25,6 +30,8 @@ class TaggingViewModel {
     
     private var timeObserver: Any?
     private var itemObserver: NSKeyValueObservation?
+    private var timelineThumbnailTask: Task<Void, Never>?
+    private var zoomTimelineThumbnailTask: Task<Void, Never>?
     
     // Security Scoped Resource tracking
     private var currentVideoURL: URL?
@@ -57,6 +64,8 @@ class TaggingViewModel {
     }
     
     deinit {
+        timelineThumbnailTask?.cancel()
+        zoomTimelineThumbnailTask?.cancel()
         if let observer = timeObserver {
             player.removeTimeObserver(observer)
         }
@@ -108,6 +117,10 @@ class TaggingViewModel {
         // Setup Player
         let item = AVPlayerItem(url: url)
         player.replaceCurrentItem(with: item)
+        currentTime = 0
+        duration = 1.0
+        zoomTimelineThumbnails = []
+        generateTimelineThumbnails(for: url)
         
         // Observe duration
         itemObserver = item.observe(\.duration, changeHandler: { [weak self] item, _ in
@@ -115,6 +128,9 @@ class TaggingViewModel {
             Task { @MainActor in
                 if item.duration.isValid && !item.duration.isIndefinite {
                     self.duration = item.duration.seconds
+                    if self.timelineThumbnails.isEmpty && !self.isGeneratingTimelineThumbnails {
+                        self.generateTimelineThumbnails(for: url)
+                    }
                 }
             }
         })
@@ -237,6 +253,12 @@ class TaggingViewModel {
     }
     
     private func stopAccessingCurrentVideo() {
+        timelineThumbnailTask?.cancel()
+        zoomTimelineThumbnailTask?.cancel()
+        timelineThumbnails = []
+        zoomTimelineThumbnails = []
+        isGeneratingTimelineThumbnails = false
+        isGeneratingZoomTimelineThumbnails = false
         if let url = currentVideoURL {
             url.stopAccessingSecurityScopedResource()
             currentVideoURL = nil
@@ -255,7 +277,8 @@ class TaggingViewModel {
     }
     
     func seek(to time: Double, completion: @escaping () -> Void = {}) {
-        let cmTime = CMTime(seconds: time, preferredTimescale: 600)
+        let safeTime = max(0, min(time, duration))
+        let cmTime = CMTime(seconds: safeTime, preferredTimescale: 600)
         isSeeking = true
         player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             Task { @MainActor in
@@ -338,6 +361,94 @@ class TaggingViewModel {
     func saveChanges() {
         // SwiftData autosaves, but we can explicitly save if needed
         try? modelContext?.save()
+    }
+
+    // MARK: - Timeline Thumbnails
+
+    private func generateTimelineThumbnails(for url: URL) {
+        timelineThumbnailTask?.cancel()
+        timelineThumbnails = []
+        isGeneratingTimelineThumbnails = true
+
+        timelineThumbnailTask = Task(priority: .utility) { [weak self] in
+            guard let self = self else { return }
+            let thumbnails = self.buildTimelineThumbnails(for: url, timeRange: nil, preferredCount: nil)
+
+            await MainActor.run {
+                guard !Task.isCancelled else { return }
+                self.timelineThumbnails = thumbnails
+                self.isGeneratingTimelineThumbnails = false
+            }
+        }
+    }
+
+    func generateZoomTimelineThumbnails(for window: ClosedRange<Double>) {
+        guard let url = currentVideoURL else { return }
+
+        zoomTimelineThumbnailTask?.cancel()
+        isGeneratingZoomTimelineThumbnails = true
+
+        zoomTimelineThumbnailTask = Task(priority: .utility) { [weak self] in
+            guard let self = self else { return }
+            let thumbnails = self.buildTimelineThumbnails(for: url, timeRange: window, preferredCount: 36)
+
+            await MainActor.run {
+                guard !Task.isCancelled else { return }
+                self.zoomTimelineThumbnails = thumbnails
+                self.isGeneratingZoomTimelineThumbnails = false
+            }
+        }
+    }
+
+    func clearZoomTimelineThumbnails() {
+        zoomTimelineThumbnailTask?.cancel()
+        zoomTimelineThumbnails = []
+        isGeneratingZoomTimelineThumbnails = false
+    }
+
+    private func buildTimelineThumbnails(
+        for url: URL,
+        timeRange: ClosedRange<Double>?,
+        preferredCount: Int?
+    ) -> [NSImage] {
+        let asset = AVAsset(url: url)
+        let totalSeconds = asset.duration.seconds
+
+        guard totalSeconds.isFinite, totalSeconds > 0 else { return [] }
+
+        let startSecond = max(0, min(totalSeconds, timeRange?.lowerBound ?? 0))
+        let endSecond = max(startSecond, min(totalSeconds, timeRange?.upperBound ?? totalSeconds))
+        let windowSeconds = max(0.001, endSecond - startSecond)
+
+        let imageCount: Int
+        if let preferredCount {
+            imageCount = max(8, preferredCount)
+        } else {
+            imageCount = max(8, min(24, Int(windowSeconds / 12.0)))
+        }
+
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 220, height: 124)
+
+        var images: [NSImage] = []
+        images.reserveCapacity(imageCount)
+
+        for idx in 0..<imageCount {
+            if Task.isCancelled { return [] }
+            let progress = Double(idx) / Double(max(imageCount - 1, 1))
+            let second = startSecond + (progress * windowSeconds)
+            let cmTime = CMTime(seconds: second, preferredTimescale: 600)
+
+            do {
+                let cgImage = try generator.copyCGImage(at: cmTime, actualTime: nil)
+                images.append(NSImage(cgImage: cgImage, size: .zero))
+            } catch {
+                continue
+            }
+        }
+
+        return images
     }
     
     // MARK: - Export Video Clips
