@@ -21,6 +21,24 @@ struct VideoPlayerView: View {
                 .cornerRadius(6)
                 .padding(12)
                 .allowsHitTesting(false) // Pass clicks through to player
+
+            if viewModel.isTagKeyHeld {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 10, height: 10)
+                    Text("TAGGING \(viewModel.activeTagLabel ?? "")")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.white)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.black.opacity(0.65))
+                .clipShape(Capsule())
+                .padding(12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .allowsHitTesting(false)
+            }
         }
         .contentShape(Rectangle())
         .onTapGesture {

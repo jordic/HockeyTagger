@@ -28,16 +28,28 @@ struct ContentView: View {
                     return .handled
                 })
                 // Add keyboard shortcuts for tagging directly to the player focus area
-                .onKeyPress(KeyEquivalent("1"), action: {
-                    viewModel.addTag(label: "Highlight")
+                .onKeyPress(KeyEquivalent("1"), phases: [.down, .repeat, .up], action: { press in
+                    if press.phase == .down {
+                        viewModel.tagKeyDown(label: "Highlight")
+                    } else if press.phase == .up {
+                        viewModel.tagKeyUp(label: "Highlight")
+                    }
                     return .handled
                 })
-                .onKeyPress(KeyEquivalent("2"), action: {
-                    viewModel.addTag(label: "Goal")
+                .onKeyPress(KeyEquivalent("2"), phases: [.down, .repeat, .up], action: { press in
+                    if press.phase == .down {
+                        viewModel.tagKeyDown(label: "Goal")
+                    } else if press.phase == .up {
+                        viewModel.tagKeyUp(label: "Goal")
+                    }
                     return .handled
                 })
-                .onKeyPress(KeyEquivalent("3"), action: {
-                    viewModel.addTag(label: "Defense")
+                .onKeyPress(KeyEquivalent("3"), phases: [.down, .repeat, .up], action: { press in
+                    if press.phase == .down {
+                        viewModel.tagKeyDown(label: "Defense")
+                    } else if press.phase == .up {
+                        viewModel.tagKeyUp(label: "Defense")
+                    }
                     return .handled
                 })
                 .onKeyPress(.escape, action: {

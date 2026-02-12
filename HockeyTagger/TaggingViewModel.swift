@@ -40,6 +40,9 @@ class TaggingViewModel {
     // Playback State Tracking
     private var timeControlStatusObserver: NSKeyValueObservation?
     private var isSeeking = false
+    private var activeTagKeyPressStart: [String: Double] = [:]
+    var activeTagLabel: String?
+    var isTagKeyHeld = false
     
     // Export Status Tracking
     var exportMessage: String?
@@ -330,8 +333,45 @@ class TaggingViewModel {
         guard let project = currentProject else { return }
         let start = max(0, currentTime - 2.0) // Default 2s before
         let end = min(duration, currentTime + 2.0) // Default 2s after
-        
-        let newClip = Clip(label: label, startTime: start, endTime: end)
+        createTag(label: label, start: start, end: end, project: project)
+    }
+
+    func tagKeyDown(label: String) {
+        guard activeTagKeyPressStart[label] == nil else { return }
+        activeTagKeyPressStart[label] = currentTime
+        activeTagLabel = label
+        isTagKeyHeld = true
+    }
+
+    func tagKeyUp(label: String) {
+        guard let pressStart = activeTagKeyPressStart.removeValue(forKey: label) else {
+            // If we didn't capture key down for any reason, preserve previous tap behavior.
+            addTag(label: label)
+            return
+        }
+        isTagKeyHeld = !activeTagKeyPressStart.isEmpty
+        activeTagLabel = activeTagKeyPressStart.keys.first
+
+        let pressEnd = max(pressStart + 0.01, currentTime)
+        let heldDuration = pressEnd - pressStart
+
+        // Quick tap preserves existing default behavior.
+        if heldDuration < 0.20 {
+            addTag(label: label)
+            return
+        }
+
+        guard let project = currentProject else { return }
+        let start = max(0, min(pressStart, pressEnd))
+        let end = min(duration, max(pressStart, pressEnd))
+        createTag(label: label, start: start, end: end, project: project)
+    }
+
+    private func createTag(label: String, start: Double, end: Double, project: Project) {
+        let safeStart = max(0, min(start, end - 0.01))
+        let safeEnd = min(duration, max(end, safeStart + 0.01))
+
+        let newClip = Clip(label: label, startTime: safeStart, endTime: safeEnd)
         newClip.project = project
         modelContext?.insert(newClip)
     }

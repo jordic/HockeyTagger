@@ -124,7 +124,6 @@ struct TagButton: View {
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
-        .keyboardShortcut(shortcut, modifiers: [])
     }
 }
 
