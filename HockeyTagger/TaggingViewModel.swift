@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 import AVKit
 import AppKit
+import UniformTypeIdentifiers
 
 @Observable
 class TaggingViewModel {
@@ -57,6 +58,8 @@ class TaggingViewModel {
     
     private var downloadTask: Task<Void, Never>?
     private var downloadTempDirectoryURL: URL?
+    private var downloadExportSession: AVAssetExportSession?
+    private var downloadProgressTask: Task<Void, Never>?
     
     init() {
         // Setup periodic time observer
@@ -78,6 +81,8 @@ class TaggingViewModel {
     
     deinit {
         downloadTask?.cancel()
+        downloadProgressTask?.cancel()
+        downloadExportSession?.cancelExport()
         timelineThumbnailTask?.cancel()
         zoomTimelineThumbnailTask?.cancel()
         if let observer = timeObserver {
@@ -738,6 +743,8 @@ class TaggingViewModel {
         guard isDownloadingVideo else { return }
         downloadStatusText = "Cancelling download..."
         downloadTask?.cancel()
+        downloadProgressTask?.cancel()
+        downloadExportSession?.cancelExport()
     }
 
     private func downloadVideoFromPlaylistURL(_ inputURL: URL) async {
@@ -773,100 +780,25 @@ class TaggingViewModel {
                     userInfo: [NSLocalizedDescriptionKey: "Could not load any media playlist variant from the provided URL."]
                 )
             }
-
-            let segmentURLs = parseSegmentURLs(from: mediaPlaylistText, baseURL: mediaPlaylistURL)
-
-            guard !segmentURLs.isEmpty else {
-                throw NSError(
-                    domain: "VideoDownload",
-                    code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "No media segments were found in the playlist."]
-                )
-            }
-
-            await MainActor.run {
-                downloadStatusText = "Downloading video segments..."
-                downloadProgress = 0
-            }
-
-            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            await MainActor.run {
-                downloadTempDirectoryURL = tempDir
-            }
-            let segmentDirectory = tempDir.appendingPathComponent("segments", isDirectory: true)
-            try FileManager.default.createDirectory(at: segmentDirectory, withIntermediateDirectories: true)
-
-            let totalCount = segmentURLs.count
-            let maxParallelDownloads = 8
-            var completedCount = 0
-
-            var batchStart = 0
-            while batchStart < totalCount {
-                try Task.checkCancellation()
-                let batchEnd = min(batchStart + maxParallelDownloads, totalCount)
-
-                try await withThrowingTaskGroup(of: Void.self) { group in
-                    for index in batchStart..<batchEnd {
-                        let segmentURL = segmentURLs[index]
-                        let segmentOutputURL = segmentDirectory.appendingPathComponent(String(format: "%06d.ts", index))
-                        group.addTask {
-                            try Task.checkCancellation()
-                            var request = URLRequest(url: segmentURL)
-                            request.timeoutInterval = 60
-                            let (tempSegmentURL, response) = try await URLSession.shared.download(for: request)
-                            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                                throw NSError(
-                                    domain: "VideoDownload",
-                                    code: http.statusCode,
-                                    userInfo: [NSLocalizedDescriptionKey: "Failed to download segment (\(http.statusCode)):\n\(segmentURL.absoluteString)"]
-                                )
-                            }
-
-                            if FileManager.default.fileExists(atPath: segmentOutputURL.path) {
-                                try FileManager.default.removeItem(at: segmentOutputURL)
-                            }
-                            try FileManager.default.moveItem(at: tempSegmentURL, to: segmentOutputURL)
-                        }
+            let _ = mediaPlaylistText // keep validation path explicit
+            let tempResult: (URL, String)
+            do {
+                tempResult = try await exportPlaylistToTempFile(mediaPlaylistURL)
+            } catch {
+                if isAVFoundationOperationStopped(error) {
+                    await MainActor.run {
+                        downloadStatusText = "Exporter stopped. Falling back to segment download..."
+                        downloadProgress = 0
                     }
-
-                    for try await _ in group {
-                        completedCount += 1
-                        await MainActor.run {
-                            downloadProgress = Double(completedCount) / Double(totalCount)
-                            downloadStatusText = "Downloading segment \(completedCount) of \(totalCount)..."
-                        }
-                    }
-                }
-
-                batchStart = batchEnd
-            }
-
-            let suggestedName = mediaPlaylistURL.deletingPathExtension().lastPathComponent + ".ts"
-            let tempFileURL = tempDir.appendingPathComponent(suggestedName)
-            _ = FileManager.default.createFile(atPath: tempFileURL.path, contents: nil)
-
-            let fileHandle = try FileHandle(forWritingTo: tempFileURL)
-            defer {
-                try? fileHandle.close()
-            }
-
-            await MainActor.run {
-                downloadStatusText = "Merging downloaded segments..."
-                downloadProgress = 0
-            }
-
-            for index in 0..<totalCount {
-                try Task.checkCancellation()
-                let segmentPathURL = segmentDirectory.appendingPathComponent(String(format: "%06d.ts", index))
-                let data = try Data(contentsOf: segmentPathURL)
-                try fileHandle.write(contentsOf: data)
-
-                await MainActor.run {
-                    downloadProgress = Double(index + 1) / Double(totalCount)
-                    downloadStatusText = "Merging segment \(index + 1) of \(totalCount)..."
+                    tempResult = try await fallbackDownloadSegmentsToTempFile(
+                        mediaPlaylistText: mediaPlaylistText,
+                        mediaPlaylistURL: mediaPlaylistURL
+                    )
+                } else {
+                    throw error
                 }
             }
+            let (tempFileURL, suggestedName) = tempResult
 
             await MainActor.run {
                 isDownloadingVideo = false
@@ -892,6 +824,227 @@ class TaggingViewModel {
                 downloadTask = nil
             }
         }
+    }
+
+    private func exportPlaylistToTempFile(_ playlistURL: URL) async throws -> (URL, String) {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        await MainActor.run {
+            downloadTempDirectoryURL = tempDir
+            downloadProgress = 0
+            downloadStatusText = "Downloading and muxing video..."
+        }
+
+        let asset = AVAsset(url: playlistURL)
+        let preferredPresets = [AVAssetExportPresetHighestQuality, AVAssetExportPresetPassthrough]
+        guard let preset = preferredPresets.first(where: { AVAssetExportSession.exportPresets(compatibleWith: asset).contains($0) }) else {
+            throw NSError(
+                domain: "VideoDownload",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "This HLS stream is not exportable with available presets."]
+            )
+        }
+
+        guard let exportSession = AVAssetExportSession(asset: asset, presetName: preset) else {
+            throw NSError(
+                domain: "VideoDownload",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "Could not create export session for the HLS playlist."]
+            )
+        }
+
+        let fileType: AVFileType
+        if exportSession.supportedFileTypes.contains(.mp4) {
+            fileType = .mp4
+        } else if exportSession.supportedFileTypes.contains(.mov) {
+            fileType = .mov
+        } else if let first = exportSession.supportedFileTypes.first {
+            fileType = first
+        } else {
+            throw NSError(
+                domain: "VideoDownload",
+                code: 13,
+                userInfo: [NSLocalizedDescriptionKey: "No supported output file types for this stream."]
+            )
+        }
+
+        let ext: String
+        switch fileType {
+        case .mp4: ext = "mp4"
+        case .mov: ext = "mov"
+        default: ext = "mp4"
+        }
+
+        let baseName = playlistURL.deletingPathExtension().lastPathComponent
+        let suggestedName = (baseName.isEmpty ? "downloaded_video" : baseName) + ".\(ext)"
+        let outputURL = tempDir.appendingPathComponent(suggestedName)
+        try? FileManager.default.removeItem(at: outputURL)
+
+        exportSession.outputURL = outputURL
+        exportSession.outputFileType = fileType
+        exportSession.shouldOptimizeForNetworkUse = true
+
+        await MainActor.run {
+            downloadExportSession = exportSession
+        }
+
+        downloadProgressTask?.cancel()
+        downloadProgressTask = Task { [weak self] in
+            guard let self = self else { return }
+            while !Task.isCancelled {
+                let progress = Double(exportSession.progress)
+                await MainActor.run {
+                    self.downloadProgress = progress
+                }
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+
+        await exportSession.export()
+        downloadProgressTask?.cancel()
+        await MainActor.run {
+            downloadExportSession = nil
+        }
+
+        if exportSession.status == .cancelled {
+            throw CancellationError()
+        }
+
+        if exportSession.status != .completed {
+            let exportError = exportSession.error
+            if let exportError {
+                throw exportError
+            }
+            throw NSError(
+                domain: "VideoDownload",
+                code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "Export failed with status \(exportSession.status.rawValue)."]
+            )
+        }
+
+        await MainActor.run {
+            downloadProgress = 1.0
+        }
+        return (outputURL, suggestedName)
+    }
+
+    private func fallbackDownloadSegmentsToTempFile(
+        mediaPlaylistText: String,
+        mediaPlaylistURL: URL
+    ) async throws -> (URL, String) {
+        let segmentURLs = parseSegmentURLs(from: mediaPlaylistText, baseURL: mediaPlaylistURL)
+        guard !segmentURLs.isEmpty else {
+            throw NSError(
+                domain: "VideoDownload",
+                code: 14,
+                userInfo: [NSLocalizedDescriptionKey: "No downloadable segments found in media playlist."]
+            )
+        }
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        await MainActor.run {
+            downloadTempDirectoryURL = tempDir
+            downloadStatusText = "Downloading HLS segments..."
+            downloadProgress = 0
+        }
+
+        let segmentDirectory = tempDir.appendingPathComponent("segments", isDirectory: true)
+        try FileManager.default.createDirectory(at: segmentDirectory, withIntermediateDirectories: true)
+
+        let initSegmentURL = parseInitializationSegmentURL(from: mediaPlaylistText, baseURL: mediaPlaylistURL)
+        let initSegmentPath: URL? = (initSegmentURL != nil) ? tempDir.appendingPathComponent("init.seg") : nil
+        if let initURL = initSegmentURL, let initPath = initSegmentPath {
+            let (tmp, response) = try await URLSession.shared.download(from: initURL)
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                throw NSError(
+                    domain: "VideoDownload",
+                    code: http.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to download initialization segment (\(http.statusCode))."]
+                )
+            }
+            if FileManager.default.fileExists(atPath: initPath.path) {
+                try FileManager.default.removeItem(at: initPath)
+            }
+            try FileManager.default.moveItem(at: tmp, to: initPath)
+        }
+
+        let totalCount = segmentURLs.count
+        let maxParallelDownloads = 8
+        var completedCount = 0
+        var batchStart = 0
+
+        while batchStart < totalCount {
+            try Task.checkCancellation()
+            let batchEnd = min(batchStart + maxParallelDownloads, totalCount)
+
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for index in batchStart..<batchEnd {
+                    let segmentURL = segmentURLs[index]
+                    let segmentOutputURL = segmentDirectory.appendingPathComponent(String(format: "%06d.seg", index))
+                    group.addTask {
+                        try Task.checkCancellation()
+                        var request = URLRequest(url: segmentURL)
+                        request.timeoutInterval = 60
+                        let (tempSegmentURL, response) = try await URLSession.shared.download(for: request)
+                        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                            throw NSError(
+                                domain: "VideoDownload",
+                                code: http.statusCode,
+                                userInfo: [NSLocalizedDescriptionKey: "Failed to download segment (\(http.statusCode)):\n\(segmentURL.absoluteString)"]
+                            )
+                        }
+                        if FileManager.default.fileExists(atPath: segmentOutputURL.path) {
+                            try FileManager.default.removeItem(at: segmentOutputURL)
+                        }
+                        try FileManager.default.moveItem(at: tempSegmentURL, to: segmentOutputURL)
+                    }
+                }
+
+                for try await _ in group {
+                    completedCount += 1
+                    await MainActor.run {
+                        downloadProgress = Double(completedCount) / Double(totalCount)
+                        downloadStatusText = "Downloading segment \(completedCount) of \(totalCount)..."
+                    }
+                }
+            }
+
+            batchStart = batchEnd
+        }
+
+        let firstPath = segmentURLs.first?.lastPathComponent.lowercased() ?? ""
+        let ext = firstPath.contains(".m4s") || initSegmentURL != nil ? "mp4" : "ts"
+        let baseName = mediaPlaylistURL.deletingPathExtension().lastPathComponent
+        let suggestedName = (baseName.isEmpty ? "downloaded_video" : baseName) + ".\(ext)"
+        let outputURL = tempDir.appendingPathComponent(suggestedName)
+        _ = FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+
+        let fileHandle = try FileHandle(forWritingTo: outputURL)
+        defer { try? fileHandle.close() }
+
+        await MainActor.run {
+            downloadStatusText = "Merging segments..."
+            downloadProgress = 0
+        }
+
+        if let initPath = initSegmentPath {
+            let initData = try Data(contentsOf: initPath)
+            try fileHandle.write(contentsOf: initData)
+        }
+
+        for index in 0..<totalCount {
+            try Task.checkCancellation()
+            let segPath = segmentDirectory.appendingPathComponent(String(format: "%06d.seg", index))
+            let data = try Data(contentsOf: segPath)
+            try fileHandle.write(contentsOf: data)
+            await MainActor.run {
+                downloadProgress = Double(index + 1) / Double(totalCount)
+                downloadStatusText = "Merging segment \(index + 1) of \(totalCount)..."
+            }
+        }
+
+        return (outputURL, suggestedName)
     }
 
     private func fetchPlaylistText(from url: URL) async throws -> String {
@@ -961,6 +1114,18 @@ class TaggingViewModel {
         }
     }
 
+    private func parseInitializationSegmentURL(from playlistText: String, baseURL: URL) -> URL? {
+        let lines = playlistText
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let mapLine = lines.first(where: { $0.hasPrefix("#EXT-X-MAP:") }) else { return nil }
+        guard let range = mapLine.range(of: "URI=\"") else { return nil }
+        let tail = mapLine[range.upperBound...]
+        guard let endQuote = tail.firstIndex(of: "\"") else { return nil }
+        let uri = String(tail[..<endQuote])
+        return resolveURL(from: uri, baseURL: baseURL)
+    }
+
     private func resolveURL(from rawPath: String, baseURL: URL) -> URL? {
         let path = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty else { return nil }
@@ -999,15 +1164,21 @@ class TaggingViewModel {
 
     @MainActor
     private func promptForSaveDownloadedVideo(tempURL: URL, suggestedName: String) {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
+        let panel = NSSavePanel()
         panel.prompt = "Save Video"
-        panel.message = "Choose a destination folder for the downloaded video."
+        panel.message = "Choose where to save the downloaded video."
+        panel.nameFieldStringValue = suggestedName
+        panel.canCreateDirectories = true
+        if suggestedName.lowercased().hasSuffix(".mov") {
+            panel.allowedContentTypes = [UTType.quickTimeMovie]
+        } else if suggestedName.lowercased().hasSuffix(".ts"),
+                  let tsType = UTType(filenameExtension: "ts") {
+            panel.allowedContentTypes = [tsType]
+        } else {
+            panel.allowedContentTypes = [UTType.mpeg4Movie]
+        }
 
-        if panel.runModal() == .OK, let folderURL = panel.url {
-            let destinationURL = folderURL.appendingPathComponent(suggestedName)
+        if panel.runModal() == .OK, let destinationURL = panel.url {
             do {
                 if FileManager.default.fileExists(atPath: destinationURL.path) {
                     try FileManager.default.removeItem(at: destinationURL)
@@ -1038,6 +1209,18 @@ class TaggingViewModel {
             return true
         }
         if let urlError = error as? URLError, urlError.code == .cancelled {
+            return true
+        }
+        return false
+    }
+
+    private func isAVFoundationOperationStopped(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == AVFoundationErrorDomain && nsError.code == -11838 {
+            return true
+        }
+        let message = nsError.localizedDescription.lowercased()
+        if message.contains("operation stopped") {
             return true
         }
         return false
