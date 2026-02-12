@@ -44,6 +44,19 @@ class TaggingViewModel {
     var exportMessage: String?
     var showingExportAlert = false
     var isExporting = false
+
+    // Download Status Tracking
+    var showingDownloadVideoSheet = false
+    var downloadURLInput = ""
+    var isDownloadingVideo = false
+    var downloadProgress: Double = 0
+    var downloadStatusText = "Preparing download..."
+    var downloadMessage: String?
+    var showingDownloadAlert = false
+    var canCancelDownload = false
+    
+    private var downloadTask: Task<Void, Never>?
+    private var downloadTempDirectoryURL: URL?
     
     init() {
         // Setup periodic time observer
@@ -64,6 +77,7 @@ class TaggingViewModel {
     }
     
     deinit {
+        downloadTask?.cancel()
         timelineThumbnailTask?.cancel()
         zoomTimelineThumbnailTask?.cancel()
         if let observer = timeObserver {
@@ -625,6 +639,339 @@ class TaggingViewModel {
         if panel.runModal() == .OK, let url = panel.url {
             loadVideo(url: url)
         }
+    }
+
+    @MainActor
+    func promptForDownloadVideo() {
+        downloadURLInput = ""
+        showingDownloadVideoSheet = true
+    }
+
+    @MainActor
+    func startDownloadFromInput() {
+        let rawInput = downloadURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = normalizeInputURLString(rawInput)
+        guard let inputURL = URL(string: normalized), inputURL.scheme != nil else {
+            downloadMessage = "Invalid URL. Please paste a full playlist URL."
+            showingDownloadAlert = true
+            return
+        }
+
+        showingDownloadVideoSheet = false
+        downloadTask?.cancel()
+        downloadTask = Task { [weak self] in
+            await self?.downloadVideoFromPlaylistURL(inputURL)
+        }
+    }
+
+    @MainActor
+    func cancelDownloadVideo() {
+        guard isDownloadingVideo else { return }
+        downloadStatusText = "Cancelling download..."
+        downloadTask?.cancel()
+    }
+
+    private func downloadVideoFromPlaylistURL(_ inputURL: URL) async {
+        await MainActor.run {
+            isDownloadingVideo = true
+            canCancelDownload = true
+            downloadProgress = 0
+            downloadStatusText = "Fetching playlist..."
+        }
+
+        do {
+            try Task.checkCancellation()
+            let rootPlaylist = try await fetchPlaylistText(from: inputURL)
+            let mediaPlaylistCandidates = resolveMediaPlaylistURLs(from: rootPlaylist, baseURL: inputURL)
+            var resolvedMediaURL: URL?
+            var mediaPlaylistText: String?
+
+            for candidate in mediaPlaylistCandidates {
+                do {
+                    let text = try await fetchPlaylistText(from: candidate)
+                    resolvedMediaURL = candidate
+                    mediaPlaylistText = text
+                    break
+                } catch {
+                    continue
+                }
+            }
+
+            guard let mediaPlaylistURL = resolvedMediaURL, let mediaPlaylistText else {
+                throw NSError(
+                    domain: "VideoDownload",
+                    code: 10,
+                    userInfo: [NSLocalizedDescriptionKey: "Could not load any media playlist variant from the provided URL."]
+                )
+            }
+
+            let segmentURLs = parseSegmentURLs(from: mediaPlaylistText, baseURL: mediaPlaylistURL)
+
+            guard !segmentURLs.isEmpty else {
+                throw NSError(
+                    domain: "VideoDownload",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "No media segments were found in the playlist."]
+                )
+            }
+
+            await MainActor.run {
+                downloadStatusText = "Downloading video segments..."
+                downloadProgress = 0
+            }
+
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            await MainActor.run {
+                downloadTempDirectoryURL = tempDir
+            }
+            let segmentDirectory = tempDir.appendingPathComponent("segments", isDirectory: true)
+            try FileManager.default.createDirectory(at: segmentDirectory, withIntermediateDirectories: true)
+
+            let totalCount = segmentURLs.count
+            let maxParallelDownloads = 8
+            var completedCount = 0
+
+            var batchStart = 0
+            while batchStart < totalCount {
+                try Task.checkCancellation()
+                let batchEnd = min(batchStart + maxParallelDownloads, totalCount)
+
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    for index in batchStart..<batchEnd {
+                        let segmentURL = segmentURLs[index]
+                        let segmentOutputURL = segmentDirectory.appendingPathComponent(String(format: "%06d.ts", index))
+                        group.addTask {
+                            try Task.checkCancellation()
+                            var request = URLRequest(url: segmentURL)
+                            request.timeoutInterval = 60
+                            let (tempSegmentURL, response) = try await URLSession.shared.download(for: request)
+                            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                                throw NSError(
+                                    domain: "VideoDownload",
+                                    code: http.statusCode,
+                                    userInfo: [NSLocalizedDescriptionKey: "Failed to download segment (\(http.statusCode)):\n\(segmentURL.absoluteString)"]
+                                )
+                            }
+
+                            if FileManager.default.fileExists(atPath: segmentOutputURL.path) {
+                                try FileManager.default.removeItem(at: segmentOutputURL)
+                            }
+                            try FileManager.default.moveItem(at: tempSegmentURL, to: segmentOutputURL)
+                        }
+                    }
+
+                    for try await _ in group {
+                        completedCount += 1
+                        await MainActor.run {
+                            downloadProgress = Double(completedCount) / Double(totalCount)
+                            downloadStatusText = "Downloading segment \(completedCount) of \(totalCount)..."
+                        }
+                    }
+                }
+
+                batchStart = batchEnd
+            }
+
+            let suggestedName = mediaPlaylistURL.deletingPathExtension().lastPathComponent + ".ts"
+            let tempFileURL = tempDir.appendingPathComponent(suggestedName)
+            _ = FileManager.default.createFile(atPath: tempFileURL.path, contents: nil)
+
+            let fileHandle = try FileHandle(forWritingTo: tempFileURL)
+            defer {
+                try? fileHandle.close()
+            }
+
+            await MainActor.run {
+                downloadStatusText = "Merging downloaded segments..."
+                downloadProgress = 0
+            }
+
+            for index in 0..<totalCount {
+                try Task.checkCancellation()
+                let segmentPathURL = segmentDirectory.appendingPathComponent(String(format: "%06d.ts", index))
+                let data = try Data(contentsOf: segmentPathURL)
+                try fileHandle.write(contentsOf: data)
+
+                await MainActor.run {
+                    downloadProgress = Double(index + 1) / Double(totalCount)
+                    downloadStatusText = "Merging segment \(index + 1) of \(totalCount)..."
+                }
+            }
+
+            await MainActor.run {
+                isDownloadingVideo = false
+                canCancelDownload = false
+            }
+
+            await MainActor.run {
+                promptForSaveDownloadedVideo(tempURL: tempFileURL, suggestedName: suggestedName)
+                downloadTask = nil
+            }
+        } catch {
+            await MainActor.run {
+                isDownloadingVideo = false
+                canCancelDownload = false
+                if Task.isCancelled || isCancellationError(error) {
+                    cleanupDownloadTempFiles()
+                    downloadMessage = "Download cancelled."
+                } else {
+                    cleanupDownloadTempFiles()
+                    downloadMessage = "Download failed: \(error.localizedDescription)"
+                }
+                showingDownloadAlert = true
+                downloadTask = nil
+            }
+        }
+    }
+
+    private func fetchPlaylistText(from url: URL) async throws -> String {
+        let (data, response) = try await URLSession.shared.data(from: url)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw NSError(
+                domain: "VideoDownload",
+                code: http.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to fetch playlist (\(http.statusCode)):\n\(url.absoluteString)"]
+            )
+        }
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw NSError(
+                domain: "VideoDownload",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Playlist is not valid UTF-8 text."]
+            )
+        }
+        return text
+    }
+
+    private func resolveMediaPlaylistURLs(from playlistText: String, baseURL: URL) -> [URL] {
+        let lines = playlistText
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let streamInfoLines = lines.enumerated().filter { $0.element.hasPrefix("#EXT-X-STREAM-INF") }
+        if streamInfoLines.isEmpty {
+            return [baseURL]
+        }
+
+        var candidateRelativePaths: [String] = []
+        for (index, _) in streamInfoLines {
+            let nextIndex = index + 1
+            if nextIndex < lines.count {
+                let nextLine = lines[nextIndex]
+                if !nextLine.hasPrefix("#") {
+                    candidateRelativePaths.append(nextLine)
+                }
+            }
+        }
+
+        if candidateRelativePaths.isEmpty {
+            return [baseURL]
+        }
+
+        let preferredOrder = candidateRelativePaths.sorted { lhs, rhs in
+            let lHD = lhs.lowercased().contains("hd.m3u8")
+            let rHD = rhs.lowercased().contains("hd.m3u8")
+            if lHD != rHD { return lHD && !rHD }
+            return lhs < rhs
+        }
+
+        return preferredOrder.compactMap { resolveURL(from: $0, baseURL: baseURL) }
+    }
+
+    private func parseSegmentURLs(from playlistText: String, baseURL: URL) -> [URL] {
+        let lines = playlistText
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        return lines.compactMap { line in
+            guard !line.hasPrefix("#"), !line.lowercased().contains(".m3u8") else { return nil }
+            return resolveURL(from: line, baseURL: baseURL)
+        }
+    }
+
+    private func resolveURL(from rawPath: String, baseURL: URL) -> URL? {
+        let path = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return nil }
+
+        if let absolute = URL(string: path), absolute.scheme != nil {
+            return absolute
+        }
+
+        if path.hasPrefix("//"), let scheme = baseURL.scheme {
+            return URL(string: "\(scheme):\(path)")
+        }
+
+        if path.hasPrefix("/") {
+            var comps = URLComponents()
+            comps.scheme = baseURL.scheme
+            comps.host = baseURL.host
+            comps.port = baseURL.port
+            comps.path = path
+            return comps.url
+        }
+
+        if let relativeToFile = URL(string: path, relativeTo: baseURL)?.absoluteURL {
+            return relativeToFile
+        }
+
+        let directoryBase = baseURL.deletingLastPathComponent()
+        return URL(string: path, relativeTo: directoryBase)?.absoluteURL
+    }
+
+    private func normalizeInputURLString(_ value: String) -> String {
+        if value.hasPrefix("http://") || value.hasPrefix("https://") {
+            return value
+        }
+        return "https://\(value)"
+    }
+
+    @MainActor
+    private func promptForSaveDownloadedVideo(tempURL: URL, suggestedName: String) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "Save Video"
+        panel.message = "Choose a destination folder for the downloaded video."
+
+        if panel.runModal() == .OK, let folderURL = panel.url {
+            let destinationURL = folderURL.appendingPathComponent(suggestedName)
+            do {
+                if FileManager.default.fileExists(atPath: destinationURL.path) {
+                    try FileManager.default.removeItem(at: destinationURL)
+                }
+                try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+                cleanupDownloadTempFiles()
+                downloadMessage = "Video downloaded successfully to:\n\(destinationURL.path)"
+            } catch {
+                downloadMessage = "Downloaded to temp, but failed to move file: \(error.localizedDescription)"
+            }
+        } else {
+            downloadMessage = "Download completed, but save was cancelled. Temp file remains at:\n\(tempURL.path)"
+            downloadTempDirectoryURL = nil
+        }
+        showingDownloadAlert = true
+    }
+
+    @MainActor
+    private func cleanupDownloadTempFiles() {
+        if let tempDir = downloadTempDirectoryURL {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+        downloadTempDirectoryURL = nil
+    }
+
+    private func isCancellationError(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        if let urlError = error as? URLError, urlError.code == .cancelled {
+            return true
+        }
+        return false
     }
     
     @MainActor

@@ -41,6 +41,10 @@ struct ContentView: View {
                     return .handled
                 })
                 .onKeyPress(.escape, action: {
+                    if viewModel.isDownloadingVideo {
+                        viewModel.cancelDownloadVideo()
+                        return .handled
+                    }
                     if case .clipEdit = viewModel.mode {
                         viewModel.exitEditMode()
                         return .handled
@@ -108,6 +112,13 @@ struct ContentView: View {
                 // This helps steal focus from the video player ZStack
             }
         }
+        .onExitCommand {
+            if viewModel.isDownloadingVideo {
+                viewModel.cancelDownloadVideo()
+            } else if case .clipEdit = viewModel.mode {
+                viewModel.exitEditMode()
+            }
+        }
         .onAppear {
             viewModel.setModelContext(modelContext)
             viewModel.loadLastOpenProject()
@@ -120,15 +131,42 @@ struct ContentView: View {
         } message: {
             Text(viewModel.exportMessage ?? "")
         }
+        .alert("Download Status", isPresented: $viewModel.showingDownloadAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(viewModel.downloadMessage ?? "")
+        }
+        .sheet(isPresented: $viewModel.showingDownloadVideoSheet) {
+            DownloadVideoSheet(viewModel: viewModel)
+        }
         .overlay {
-            if viewModel.isExporting {
+            if viewModel.isExporting || viewModel.isDownloadingVideo {
                 ZStack {
                     Color.black.opacity(0.4)
                     VStack(spacing: 20) {
-                        ProgressView()
-                            .controlSize(.large)
-                        Text("Exporting Clips...")
-                            .font(.headline)
+                        if viewModel.isExporting {
+                            ProgressView()
+                                .controlSize(.large)
+                            Text("Exporting Clips...")
+                                .font(.headline)
+                        } else {
+                            ProgressView(value: viewModel.downloadProgress)
+                                .progressViewStyle(.linear)
+                                .frame(width: 300)
+                            Text(viewModel.downloadStatusText)
+                                .font(.headline)
+                            Text("\(Int(viewModel.downloadProgress * 100))%")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if viewModel.canCancelDownload {
+                                Button("Cancel Download") {
+                                    viewModel.cancelDownloadVideo()
+                                }
+                                .keyboardShortcut(.cancelAction)
+                                .buttonStyle(.borderedProminent)
+                                .tint(.red)
+                            }
+                        }
                     }
                     .padding(40)
                     .background(.ultraThinMaterial)

@@ -17,6 +17,11 @@ struct SportsTaggerApp: App {
                     viewModel.promptForVideo()
                 }
                 .keyboardShortcut("o", modifiers: .command)
+
+                Button("Download Video...") {
+                    viewModel.promptForDownloadVideo()
+                }
+                .keyboardShortcut("d", modifiers: .command)
                 
                 Menu("Open Recent") {
                     RecentProjectsMenu(viewModel: viewModel)
