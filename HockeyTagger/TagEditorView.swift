@@ -80,6 +80,10 @@ struct TagEditorView: View {
                     viewModel.player.play()
                 }
                 .keyboardShortcut("r", modifiers: [])
+                Button("Share Clip (G)") {
+                    viewModel.shareClip(clip)
+                }
+                .keyboardShortcut("g", modifiers: [])
                 Spacer()
                 Text("Duration \(String(format: "%.1fs", clip.endTime - clip.startTime))")
                     .font(.caption)

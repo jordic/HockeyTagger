@@ -377,6 +377,75 @@ class TaggingViewModel {
         try? modelContext?.save()
     }
 
+    // MARK: - Clip Sharing
+
+    @MainActor
+    func shareClip(_ clip: Clip) {
+        Task {
+            await exportAndShareClip(clip)
+        }
+    }
+
+    private func exportAndShareClip(_ clip: Clip) async {
+        guard let project = currentProject, let videoURL = BookmarkManager.resolveBookmark(project.videoBookmark) else {
+            await MainActor.run {
+                exportMessage = "Unable to share clip: video source is unavailable."
+                showingExportAlert = true
+            }
+            return
+        }
+
+        let videoAccess = videoURL.startAccessingSecurityScopedResource()
+        defer {
+            if videoAccess { videoURL.stopAccessingSecurityScopedResource() }
+        }
+
+        let safeLabel = clip.label
+            .replacingOccurrences(of: " ", with: "_")
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        let fileName = "\(safeLabel)_\(Int(clip.startTime))-\(Int(clip.endTime)).mp4"
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString)_\(fileName)")
+
+        try? FileManager.default.removeItem(at: tempURL)
+
+        let asset = AVAsset(url: videoURL)
+        guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
+            await MainActor.run {
+                exportMessage = "Unable to share clip: failed to create export session."
+                showingExportAlert = true
+            }
+            return
+        }
+
+        exportSession.outputURL = tempURL
+        exportSession.outputFileType = .mp4
+        exportSession.timeRange = CMTimeRange(
+            start: CMTime(seconds: clip.startTime, preferredTimescale: 600),
+            duration: CMTime(seconds: max(0.1, clip.endTime - clip.startTime), preferredTimescale: 600)
+        )
+
+        await exportSession.export()
+
+        if let error = exportSession.error {
+            await MainActor.run {
+                exportMessage = "Clip export failed: \(error.localizedDescription)"
+                showingExportAlert = true
+            }
+            return
+        }
+
+        await MainActor.run {
+            let picker = NSSharingServicePicker(items: [tempURL])
+            if let view = NSApp.keyWindow?.contentView {
+                picker.show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
+            } else {
+                exportMessage = "Clip exported to temp, but no active window was available for sharing picker.\n\(tempURL.path)"
+                showingExportAlert = true
+            }
+        }
+    }
+
     // MARK: - Timeline Thumbnails
 
     private func generateTimelineThumbnails(for url: URL) {
