@@ -48,20 +48,37 @@ struct ContentView: View {
                     return .ignored
                 })
                 .focusEffectDisabled() // Remove default focus ring visual
-                
-                // Editor Panel below video (if active)
-                if case .clipEdit(let clip) = viewModel.mode {
-                    TagEditorView(viewModel: viewModel, clip: clip)
-                        .transition(.move(edge: .bottom))
-                }
             }
             .frame(minWidth: 500, minHeight: 400)
             
             // Right: Sidebar Controls (White/Light Background)
             Group {
                 if let project = viewModel.currentProject {
-                    TagListView(project: project, viewModel: viewModel)
-                        .id(project.id) // Force recreate on project change
+                    VStack(spacing: 0) {
+                        TagListView(project: project, viewModel: viewModel)
+                            .id(project.id) // Force recreate on project change
+
+                        Divider()
+
+                        Group {
+                            if case .clipEdit(let clip) = viewModel.mode {
+                                TagEditorView(viewModel: viewModel, clip: clip)
+                                    .id(clip.id)
+                            } else {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Tag Editor")
+                                        .font(.headline)
+                                    Text("Select a clip to edit while keeping playback controls available.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                                .padding(16)
+                                .background(Color(NSColor.windowBackgroundColor))
+                            }
+                        }
+                        .frame(minHeight: 220, idealHeight: 260, maxHeight: 320)
+                    }
                 } else {
                     VStack(spacing: 20) {
                         Image(systemName: "film")

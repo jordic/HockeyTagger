@@ -6,81 +6,91 @@ struct TagEditorView: View {
     @Bindable var clip: Clip
     
     var body: some View {
-        HStack(spacing: 16) {
-            // Label
-            TextField("Label", text: $clip.label)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 200)
-            
-            Divider().frame(height: 32)
-            
-            // Trimming Controls (Compact)
-            HStack(spacing: 24) {
-                // Start Group
-                HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Tag Editor")
+                    .font(.headline)
+                Spacer()
+                Button("Done (D)") {
+                    viewModel.exitEditMode()
+                }
+                .keyboardShortcut("d", modifiers: [])
+                .buttonStyle(.borderedProminent)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Label")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Label", text: $clip.label)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
                     Text("Start")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    
                     Text(formatTime(clip.startTime))
                         .font(.system(.body, design: .monospaced))
-                        .frame(width: 70, alignment: .leading)
-                    
-                    HStack(spacing: 2) {
-                        Button("-") { viewModel.adjustClipStart(clip, by: -0.5) }
-                        Button("+") { viewModel.adjustClipStart(clip, by: 0.5) }
+                    HStack(spacing: 6) {
+                        Button("-0.5s (Q)") { viewModel.adjustClipStart(clip, by: -0.5) }
+                            .keyboardShortcut("q", modifiers: [])
+                        Button("+0.5s (W)") { viewModel.adjustClipStart(clip, by: 0.5) }
+                            .keyboardShortcut("w", modifiers: [])
                     }
                     .controlSize(.small)
-                    .buttonStyle(.bordered)
+                    Button("Set To Playhead (E)") {
+                        clip.startTime = min(viewModel.currentTime, clip.endTime - 0.1)
+                    }
+                    .keyboardShortcut("e", modifiers: [])
+                    .controlSize(.small)
                 }
-                
-                // End Group
-                HStack(spacing: 8) {
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 8) {
                     Text("End")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    
                     Text(formatTime(clip.endTime))
                         .font(.system(.body, design: .monospaced))
-                        .frame(width: 70, alignment: .leading)
-                    
-                    HStack(spacing: 2) {
-                        Button("-") { viewModel.adjustClipEnd(clip, by: -0.5) }
-                        Button("+") { viewModel.adjustClipEnd(clip, by: 0.5) }
+                    HStack(spacing: 6) {
+                        Button("-0.5s (A)") { viewModel.adjustClipEnd(clip, by: -0.5) }
+                            .keyboardShortcut("a", modifiers: [])
+                        Button("+0.5s (S)") { viewModel.adjustClipEnd(clip, by: 0.5) }
+                            .keyboardShortcut("s", modifiers: [])
                     }
                     .controlSize(.small)
-                    .buttonStyle(.bordered)
+                    Button("Set To Playhead (F)") {
+                        clip.endTime = max(viewModel.currentTime, clip.startTime + 0.1)
+                    }
+                    .keyboardShortcut("f", modifiers: [])
+                    .controlSize(.small)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            
-            Spacer()
-            
-            // Actions
-            HStack(spacing: 16) {
-                Button(action: {
+
+            HStack(spacing: 8) {
+                Button("Jump To Start (J)") {
+                    viewModel.seek(to: clip.startTime)
+                }
+                .keyboardShortcut("j", modifiers: [])
+                Button("Replay Loop (R)") {
                     viewModel.seek(to: clip.startTime)
                     viewModel.player.play()
-                }) {
-                    Image(systemName: "arrow.counterclockwise")
                 }
-                .help("Replay Loop")
-                
-                Button("Done") {
-                    viewModel.exitEditMode()
-                }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
+                .keyboardShortcut("r", modifiers: [])
+                Spacer()
+                Text("Duration \(String(format: "%.1fs", clip.endTime - clip.startTime))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
             }
+            .controlSize(.small)
         }
-        .padding(.vertical, 16)
-        .padding(.horizontal, 24)
+        .padding(16)
         .frame(maxWidth: .infinity)
-        .background(Material.bar)
-        .overlay(alignment: .top) {
-            Rectangle()
-                .frame(height: 1)
-                .foregroundColor(Color.white.opacity(0.1))
-        }
+        .background(Color(NSColor.windowBackgroundColor))
     }
     
     func formatTime(_ seconds: Double) -> String {

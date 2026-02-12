@@ -321,6 +321,8 @@ class TaggingViewModel {
     }
     
     func enterEditMode(for clip: Clip) {
+        // Force mode refresh so selecting a different clip while editing always rebinds UI.
+        mode = .normal
         mode = .clipEdit(clip)
         seek(to: clip.startTime) { [weak self] in
             self?.player.play()
